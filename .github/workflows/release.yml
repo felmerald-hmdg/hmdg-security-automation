@@ -1,0 +1,133 @@
+name: Publish signed release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify PHP 8.2 and release package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout reviewed source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Set up minimum supported PHP
+        uses: shivammathur/setup-php@d52fc211a0436f8839a587b3b5b8efddab4744ea # v2
+        with:
+          php-version: '8.2'
+          extensions: sodium, zip
+          coverage: none
+      - name: Lint runtime, signer and regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do php -l "$file"; done < <(find hmdg-security-pro.php includes scripts tests -name '*.php' -print0)
+      - name: Run release-tooling tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Run updater regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test in tests/*.php; do php "$test"; done
+      - name: Verify versions and runtime archive
+        run: python3 scripts/build_release.py --source . --output dist/hmdg-security-pro.zip
+
+  publish:
+    name: Publish signed prerelease
+    needs: verify
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout verified source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Set up signing runtime
+        uses: shivammathur/setup-php@d52fc211a0436f8839a587b3b5b8efddab4744ea # v2
+        with:
+          php-version: '8.2'
+          extensions: sodium, zip
+          coverage: none
+      - name: Read verified version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python3 scripts/build_release.py --source . --version-only)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Check immutable release version
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "v$RELEASE_VERSION" --repo "$RELEASE_REPOSITORY" --json assets > "$RUNNER_TEMP/existing-release.json" 2>/dev/null; then
+            python3 -c 'import json,sys; names={a["name"] for a in json.load(open(sys.argv[1]))["assets"]}; sys.exit(0 if {"hmdg-security-pro.zip","hmdg-security-pro.zip.sig"} <= names else 1)' "$RUNNER_TEMP/existing-release.json"
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
+            echo 'This complete version already exists; release assets are immutable.'
+          else
+            echo 'skip=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build runtime-only ZIP
+        if: steps.existing.outputs.skip == 'false'
+        run: python3 scripts/build_release.py --source . --output dist/hmdg-security-pro.zip
+      - name: Sign and self-verify ZIP
+        if: steps.existing.outputs.skip == 'false'
+        env:
+          HMDG_RELEASE_SIGNING_KEY: ${{ secrets.HMDG_RELEASE_SIGNING_KEY }}
+        run: php scripts/sign-release.php dist/hmdg-security-pro.zip includes/Services/ReleaseUpdater.php
+      - name: Publish prerelease
+        if: steps.existing.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$RELEASE_VERSION" <<'PY'
+          import pathlib, re, sys
+          version = re.escape(sys.argv[1])
+          text = pathlib.Path('CHANGELOG.md').read_text(encoding='utf-8')
+          match = re.search(r'^## \[' + version + r'\].*\n(.*?)(?=^## \[|\Z)', text, re.M | re.S)
+          if not match:
+              raise SystemExit('Release notes for this version are missing.')
+          pathlib.Path('dist/release-notes.md').write_text(match.group(1).strip() + '\n', encoding='utf-8')
+          PY
+          gh release create "v$RELEASE_VERSION" dist/hmdg-security-pro.zip dist/hmdg-security-pro.zip.sig \
+            --repo "$RELEASE_REPOSITORY" --target "$GITHUB_SHA" --title "v$RELEASE_VERSION" \
+            --notes-file dist/release-notes.md --prerelease
+      - name: Record release result
+        if: success()
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          {
+            echo "Signed release v$RELEASE_VERSION is available."
+            echo 'New releases remain prereleases until the canary passes.'
+            echo 'Promote deliberately after verification:'
+            echo "gh release edit v$RELEASE_VERSION --repo $RELEASE_REPOSITORY --latest --prerelease=false"
+            echo 'Existing sites need the one-time updater bootstrap before automatic updates can work.'
+          } >> "$GITHUB_STEP_SUMMARY"
